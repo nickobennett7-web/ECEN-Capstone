@@ -1,0 +1,211 @@
+#include <iostream>
+#include <pigpio.h>
+#include <thread>
+#include <chrono>
+#include <termios.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+// g++ motor_control.cpp -o run -lpigpio -pthread
+// ================= CONFIG =================
+#define LEFT_MOTOR 17
+#define RIGHT_MOTOR 18
+
+#define PULSE_NEUTRAL 1500
+#define PULSE_FORWARD 1750
+#define PULSE_REVERSE 1250
+
+#define TCP_PORT 9000
+#define TCP_BUFFER 128
+// ========================================
+
+// Motor ramping state
+int leftPulse  = PULSE_NEUTRAL;
+int rightPulse = PULSE_NEUTRAL;
+int leftTarget  = PULSE_NEUTRAL;
+int rightTarget = PULSE_NEUTRAL;
+
+// Control mode
+enum ControlMode { MANUAL, LIDAR };
+std::atomic<ControlMode> controlMode(LIDAR);
+std::atomic<bool> running(true);
+
+// ================= TERMINAL INPUT =================
+char getKey() {
+    struct termios oldt, newt;
+    char ch = 0;
+
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+
+    int bytesWaiting;
+    ioctl(STDIN_FILENO, FIONREAD, &bytesWaiting);
+    if (bytesWaiting > 0)
+        read(STDIN_FILENO, &ch, 1);
+
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    return ch;
+}
+
+// ================= MOTOR CONTROL =================
+void updateMotors() {
+    const int rampRate = 10;
+
+    if (leftPulse < leftTarget)
+        leftPulse = std::min(leftPulse + rampRate, leftTarget);
+    else if (leftPulse > leftTarget)
+        leftPulse = std::max(leftPulse - rampRate, leftTarget);
+
+    if (rightPulse < rightTarget)
+        rightPulse = std::min(rightPulse + rampRate, rightTarget);
+    else if (rightPulse > rightTarget)
+        rightPulse = std::max(rightPulse - rampRate, rightTarget);
+
+    gpioServo(LEFT_MOTOR, leftPulse);
+    gpioServo(RIGHT_MOTOR, rightPulse);
+}
+
+void stop() {
+    leftTarget = rightTarget = PULSE_NEUTRAL;
+}
+
+void forward() {
+    leftTarget = rightTarget = PULSE_FORWARD;
+}
+
+void backward() {
+    leftTarget = rightTarget = PULSE_REVERSE;
+}
+
+void turnLeft() {
+    leftTarget = PULSE_REVERSE;
+    rightTarget = PULSE_FORWARD;
+}
+
+void turnRight() {
+    leftTarget = PULSE_FORWARD;
+    rightTarget = PULSE_REVERSE;
+}
+
+// ================= LIDAR HANDLER =================
+void handleLidarCommand(const std::string& cmd) {
+    if (controlMode.load() != LIDAR)
+        return;
+
+    if (cmd == "straight") forward();
+    else if (cmd == "left") turnLeft();
+    else if (cmd == "right") turnRight();
+    else if (cmd == "backward") backward();
+    else if (cmd == "stop") stop();
+}
+
+// ================= TCP THREAD =================
+void lidarTcpThread() {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) return;
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(TCP_PORT);
+
+    bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));
+    listen(server_fd, 1);
+
+    std::cout << "[TCP] Waiting for LiDAR connection on port " << TCP_PORT << "\n";
+
+    int client_fd = accept(server_fd, nullptr, nullptr);
+    if (client_fd < 0) return;
+
+    char buffer[TCP_BUFFER];
+
+    while (running.load()) {
+        memset(buffer, 0, TCP_BUFFER);
+        int len = recv(client_fd, buffer, TCP_BUFFER - 1, 0);
+        if (len <= 0) break;
+
+        std::string cmd(buffer);
+        cmd.erase(cmd.find_last_not_of(" \n\r\t") + 1);
+        handleLidarCommand(cmd);
+    }
+
+    close(client_fd);
+    close(server_fd);
+}
+
+// ================= MAIN =================
+int main() {
+    if (gpioInitialise() < 0) {
+        std::cerr << "pigpio init failed\n";
+        return 1;
+    }
+
+    std::thread tcpThread(lidarTcpThread);
+
+    std::cout << "\n=== Rover Control ===\n"
+              << "W - Forward (manual override)\n"
+              << "S - Backward\n"
+              << "A - Left\n"
+              << "D - Right\n"
+              << "SPACE - Stop\n"
+              << "B - Return to LiDAR\n"
+              << "Q - Quit\n\n";
+
+    stop();
+
+    while (running.load()) {
+        char key = getKey();
+
+        switch (key) {
+            case 'w': case 'W':
+                controlMode = MANUAL;
+                forward();
+                break;
+
+            case 's': case 'S':
+                controlMode = MANUAL;
+                backward();
+                break;
+
+            case 'a': case 'A':
+                controlMode = MANUAL;
+                turnLeft();
+                break;
+
+            case 'd': case 'D':
+                controlMode = MANUAL;
+                turnRight();
+                break;
+
+            case ' ':
+                controlMode = MANUAL;
+                stop();
+                break;
+
+            case 'b': case 'B':
+                controlMode = LIDAR;
+                stop();
+                std::cout << "[MODE] LiDAR control\n";
+                break;
+
+            case 'q': case 'Q':
+                running = false;
+                break;
+        }
+
+        updateMotors();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    stop();
+    tcpThread.join();
+    gpioTerminate();
+    return 0;
+}
