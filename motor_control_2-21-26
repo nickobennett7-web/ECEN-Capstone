@@ -1,0 +1,244 @@
+#include <iostream>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <algorithm>
+#include <cctype>
+#include <termios.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <pigpio.h>
+#include "sensors.h"
+
+// ── Motor / ESC config ───────────────────────────────────────
+#define LEFT_MOTOR  17
+#define RIGHT_MOTOR 18
+
+#define PULSE_NEUTRAL 1535 // new neutral
+#define PULSE_FORWARD 1600  
+#define PULSE_REVERSE 1470
+
+// ── Differential Turn Config ─────────────────────────────────
+// Outer wheel: goes forward FASTER (more power)
+// Inner wheel: goes backward SLOWER (less power)
+// This creates an efficient differential turn
+
+#define PULSE_TURN_OUTER_FWD  1690   // Outer wheel forward (fast)
+#define PULSE_TURN_INNER_REV  1380   // Inner wheel reverse (slow)
+
+// Alternative: Pivot turn (one wheel stopped, one moves)
+// Uncomment these and comment above for pivot turns:
+// #define PULSE_TURN_OUTER_FWD  1800   // Outer wheel forward
+// #define PULSE_TURN_INNER_REV  1500   // Inner wheel stopped (neutral)
+
+// ── Global state ─────────────────────────────────────────────
+enum ControlMode { MANUAL, LIDAR_MODE };
+enum Direction   { STOPPED, FORWARD, BACKWARD, LEFT, RIGHT };
+
+std::atomic<ControlMode> controlMode(LIDAR_MODE);
+std::atomic<char>        lidarCommand('X');
+std::atomic<long long>   lidarLastSeen{0};
+
+Direction currentDirection = STOPPED;
+Direction lastDirection    = STOPPED;
+
+int leftPulse   = PULSE_NEUTRAL;
+int rightPulse  = PULSE_NEUTRAL;
+int leftTarget  = PULSE_NEUTRAL;
+int rightTarget = PULSE_NEUTRAL;
+
+// ── Timestamp helper ─────────────────────────────────────────
+inline long long nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// ── Keyboard (non-blocking) ──────────────────────────────────
+char getKey() {
+    struct termios oldt, newt;
+    char ch = 0;
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+
+    int bytes;
+    ioctl(STDIN_FILENO, FIONREAD, &bytes);
+    if (bytes > 0) read(STDIN_FILENO, &ch, 1);
+
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    return ch;
+}
+
+// ── Motor helpers ────────────────────────────────────────────
+void updateMotors() {
+    const int ramp = 25;
+    leftPulse  += std::clamp(leftTarget  - leftPulse,  -ramp, ramp);
+    rightPulse += std::clamp(rightTarget - rightPulse, -ramp, ramp);
+    gpioServo(LEFT_MOTOR,  leftPulse);
+    gpioServo(RIGHT_MOTOR, rightPulse);
+}
+
+void cmdStop() { 
+    leftTarget = rightTarget = PULSE_NEUTRAL; 
+    currentDirection = STOPPED;  
+}
+
+void cmdForward() { 
+    leftTarget = rightTarget = PULSE_FORWARD; 
+    currentDirection = FORWARD;  
+}
+
+void cmdBackward() { 
+    leftTarget = rightTarget = PULSE_REVERSE; 
+    currentDirection = BACKWARD; 
+}
+
+// ── DIFFERENTIAL STEERING ────────────────────────────────────
+// Turn Left: Right wheel forward (fast), Left wheel backward (slow)
+void cmdTurnLeft() { 
+    leftTarget  = PULSE_TURN_INNER_REV;   // Inner wheel: slow reverse
+    rightTarget = PULSE_TURN_OUTER_FWD;   // Outer wheel: fast forward
+    currentDirection = LEFT;  
+}
+
+// Turn Right: Left wheel forward (fast), Right wheel backward (slow)
+void cmdTurnRight() { 
+    leftTarget  = PULSE_TURN_OUTER_FWD;   // Outer wheel: fast forward
+    rightTarget = PULSE_TURN_INNER_REV;   // Inner wheel: slow reverse
+    currentDirection = RIGHT; 
+}
+
+void applyCommand(char c) {
+    switch (c) {
+        case 'S': cmdForward();   break;
+        case 'L': cmdTurnLeft();  break;
+        case 'R': cmdTurnRight(); break;
+        case 'X': cmdStop();      break;
+        default:  cmdStop();      break;
+    }
+}
+
+void printDirection() {
+    if (currentDirection == lastDirection) return;
+    const char* s = "";
+    switch (currentDirection) {
+        case FORWARD:  s = "Forward";    break;
+        case BACKWARD: s = "Backward";   break;
+        case LEFT:     s = "Turn Left";  break;
+        case RIGHT:    s = "Turn Right"; break;
+        case STOPPED:  s = "Stopped";    break;
+    }
+    std::cout << "[MOVE] " << s << "\n";
+    lastDirection = currentDirection;
+}
+
+// ── TCP server thread ────────────────────────────────────────
+void tcpServerThread() {
+    int serverFd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(TCP_PORT);
+
+    bind(serverFd, (sockaddr*)&addr, sizeof(addr));
+    listen(serverFd, 1);
+
+    std::cout << "[TCP] Listening on port " << TCP_PORT << "\n";
+
+    while (true) {
+        int client = accept(serverFd, nullptr, nullptr);
+        std::cout << "[TCP] LiDAR node connected\n";
+
+        char cmd;
+        while (recv(client, &cmd, 1, 0) > 0) {
+            cmd = std::toupper(cmd);
+            if (cmd == 'S' || cmd == 'L' || cmd == 'R' || cmd == 'X') {
+                lidarCommand.store(cmd);
+                lidarLastSeen.store(nowMs());
+            }
+        }
+        close(client);
+        std::cout << "[TCP] LiDAR node disconnected — watchdog active\n";
+    }
+}
+
+// ── Watchdog resolver ────────────────────────────────────────
+char resolveCommand() {
+    if ((nowMs() - lidarLastSeen.load()) > LIDAR_WATCHDOG_MS) {
+        static bool warned = false;
+        if (!warned) {
+            std::cout << "[SAFETY] LiDAR watchdog timeout — STOP\n";
+            warned = true;
+        }
+        return 'X';
+    }
+    return lidarCommand.load();
+}
+
+// ── Main ─────────────────────────────────────────────────────
+int main() {
+    if (gpioInitialise() < 0) {
+        std::cerr << "[ERROR] pigpio init failed\n";
+        return 1;
+    }
+
+    std::thread(tcpServerThread).detach();
+
+    std::cout << "\n=== ROVER MOTOR CONTROLLER ===\n"
+              << "W/A/S/D  : Manual drive\n"
+              << "SPACE    : Stop\n"
+              << "B        : Return to LiDAR mode\n"
+              << "Q        : Quit\n\n"
+              << "Turn Config:\n"
+              << "  Outer wheel: " << PULSE_TURN_OUTER_FWD << " (forward)\n"
+              << "  Inner wheel: " << PULSE_TURN_INNER_REV << " (reverse)\n\n";
+
+    cmdStop();
+
+    bool running = true;
+    while (running) {
+        char key = getKey();
+
+        if (key) {
+            if (controlMode != MANUAL) {
+                std::cout << "[MODE] Switched to MANUAL\n";
+                controlMode = MANUAL;
+            }
+
+            switch (std::tolower(key)) {
+                case 'w': cmdForward();   break;
+                case 's': cmdBackward();  break;
+                case 'a': cmdTurnLeft();  break;
+                case 'd': cmdTurnRight(); break;
+                case ' ': cmdStop();      break;
+                case 'b':
+                    controlMode = LIDAR_MODE;
+                    std::cout << "[MODE] Returned to LiDAR control\n";
+                    break;
+                case 'q':
+                    running = false;
+                    break;
+            }
+        }
+
+        if (controlMode == LIDAR_MODE) {
+            char cmd = resolveCommand();
+            applyCommand(cmd);
+        }
+
+        printDirection();
+        updateMotors();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    cmdStop();
+    updateMotors();
+    gpioTerminate();
+    return 0;
+}
