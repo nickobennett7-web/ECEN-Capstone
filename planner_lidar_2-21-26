@@ -1,0 +1,310 @@
+#include <iostream>
+#include <iomanip>
+#include <csignal>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <algorithm>
+#include <chrono>
+#include <thread>
+
+// TCP
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/tcp.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
+
+// Slamtec RPLIDAR SDK
+#include "sl_lidar.h"
+#include "sl_lidar_driver.h"
+
+#include "sensors.h"
+
+// ── Signal handler ───────────────────────────────────────────
+static volatile bool g_running = true;
+static void handle_sigint(int) { g_running = false; }
+
+// ── Angle helpers ────────────────────────────────────────────
+static float norm360(float deg) {
+    while (deg <    0.0f) deg += 360.0f;
+    while (deg >= 360.0f) deg -= 360.0f;
+    return deg;
+}
+
+static float toSignedDeg(float a) {
+    a = norm360(a);
+    if (a > 180.0f) a -= 360.0f;
+    return a;
+}
+
+// ── Cone accumulator ────────────────────────────────────────
+struct ConeMins {
+    float minStraight = std::numeric_limits<float>::infinity();
+    float minLeft     = std::numeric_limits<float>::infinity();
+    float minRight    = std::numeric_limits<float>::infinity();
+    void reset() {
+        minStraight = minLeft = minRight = std::numeric_limits<float>::infinity();
+    }
+};
+
+static void updateCones(ConeMins& c, float signedDeg, float distMm) {
+    const float a = signedDeg;
+    if      (std::fabs(a) <= STRAIGHT_W)                       c.minStraight = std::min(c.minStraight, distMm);
+    else if (a < -STRAIGHT_W && a >= -TURN_W)                  c.minLeft     = std::min(c.minLeft,     distMm);
+    else if (a >  STRAIGHT_W && a <=  TURN_W)                  c.minRight    = std::min(c.minRight,    distMm);
+}
+
+// ── Navigation decision ──────────────────────────────────────
+static char decideLidarCmd(const ConeMins& c) {
+    // Hard stop
+    if (c.minStraight <= LIDAR_STOP_MM) return 'X';
+
+    // Avoidance zone — turn toward more space
+    if (c.minStraight <= LIDAR_AVOID_MM) {
+        float L = std::isfinite(c.minLeft)  ? c.minLeft  : std::numeric_limits<float>::infinity();
+        float R = std::isfinite(c.minRight) ? c.minRight : std::numeric_limits<float>::infinity();
+        return (L >= R) ? 'L' : 'R';
+    }
+
+    // Side bias — if a side is dangerously close, steer away
+    if (c.minLeft  <= LIDAR_STOP_MM) return 'R';
+    if (c.minRight <= LIDAR_STOP_MM) return 'L';
+
+    return 'S';
+}
+
+static const char* cmdToStr(char c) {
+    switch (c) {
+        case 'S': return "Straight";
+        case 'L': return "Left";
+        case 'R': return "Right";
+        case 'X': return "Stop";
+        default:  return "Unknown";
+    }
+}
+
+// ── TCP client ───────────────────────────────────────────────
+struct TcpClient {
+    int fd = -1;
+    std::string ip   = "127.0.0.1";
+    uint16_t    port = 9000;
+
+    bool connect_now() {
+        close_if_open();
+
+        fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) { std::perror("socket"); return false; }
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port   = htons(port);
+        if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
+            std::cerr << "[TCP] Bad IP: " << ip << "\n";
+            close_if_open();
+            return false;
+        }
+
+        if (::connect(fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+            close_if_open();
+            return false;
+        }
+
+        // Disable Nagle — we send single-byte commands, latency matters
+        int one = 1;
+        ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+        return true;   // ← fix: was missing in original
+    }
+
+    void close_if_open() {
+        if (fd >= 0) { ::close(fd); fd = -1; }
+    }
+
+    bool is_connected() const { return fd >= 0; }
+
+    bool send_cmd(char c) {
+        if (fd < 0) return false;
+        ssize_t n = ::send(fd, &c, 1, 0);
+        if (n == 1) return true;
+        close_if_open();
+        return false;
+    }
+};
+
+// ── Main ─────────────────────────────────────────────────────
+int main(int argc, char** argv) {
+    std::signal(SIGINT, handle_sigint);
+
+    // Defaults
+    std::string lidarPort = "/dev/ttyUSB0";
+    int         lidarBaud = 115200;
+    std::string motorIP   = "127.0.0.1";
+    uint16_t    motorPort = 9000;
+
+    if (argc >= 2) lidarPort = argv[1];
+    if (argc >= 3) lidarBaud = std::stoi(argv[2]);
+    if (argc >= 4) motorIP   = argv[3];
+    if (argc >= 5) motorPort = static_cast<uint16_t>(std::stoi(argv[4]));
+
+    // Stability filter — require N consistent revolutions before changing output
+    const int REQUIRE_SAME_REV = 2;
+
+    // Heartbeat interval — must be < LIDAR_WATCHDOG_MS in motor controller
+    const int HEARTBEAT_MS = 80;
+
+    // ── TCP connect ──────────────────────────────────────────
+    TcpClient tcp;
+    tcp.ip   = motorIP;
+    tcp.port = motorPort;
+
+    auto lastConnectTry = std::chrono::steady_clock::now();
+    auto lastHeartbeat  = std::chrono::steady_clock::now();
+
+    std::cout << "=== LiDAR Node (TCP Client) ===\n"
+              << "LiDAR  : " << lidarPort << " @ " << lidarBaud << "\n"
+              << "Motor  : " << motorIP   << ":" << motorPort   << "\n"
+              << "Cones  : STRAIGHT ±" << STRAIGHT_W << "°"
+              << "  LEFT/RIGHT ±" << TURN_W << "°\n"
+              << "STOP=" << LIDAR_STOP_MM << "mm  AVOID=" << LIDAR_AVOID_MM << "mm\n\n";
+
+    // Wait for motor controller to come up
+    while (!tcp.is_connected() && g_running) {
+        auto now = std::chrono::steady_clock::now();
+        if (now - lastConnectTry > std::chrono::milliseconds(300)) {
+            lastConnectTry = now;
+            if (tcp.connect_now()) {
+                std::cout << "[TCP] Connected to motor controller\n";
+                tcp.send_cmd('X');
+            } else {
+                std::cout << "[TCP] Waiting for motor controller...\n";
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    // ── LiDAR init ───────────────────────────────────────────
+    using namespace sl;
+
+    ILidarDriver* drv = *createLidarDriver();
+    if (!drv) { std::cerr << "[ERROR] Failed to create LidarDriver\n"; return 1; }
+
+    IChannel* channel = *createSerialPortChannel(lidarPort.c_str(), lidarBaud);
+    if (!channel) { std::cerr << "[ERROR] Failed to create serial channel\n"; delete drv; return 1; }
+
+    sl_result ans = drv->connect(channel);
+    if (SL_IS_FAIL(ans)) {
+        std::cerr << "[ERROR] LiDAR connect failed: 0x" << std::hex << ans << std::dec << "\n";
+        delete drv;
+        return 1;
+    }
+
+    drv->setMotorSpeed();
+    ans = drv->startScan(false, true);
+    if (SL_IS_FAIL(ans)) {
+        std::cerr << "[ERROR] startScan failed: 0x" << std::hex << ans << std::dec << "\n";
+        drv->setMotorSpeed(0);
+        drv->disconnect();
+        delete drv;
+        return 1;
+    }
+
+    std::cout << "[LiDAR] Scanning...\n\n";
+
+    // ── Scan loop ────────────────────────────────────────────
+    constexpr size_t MAX_NODES = 8192;
+    sl_lidar_response_measurement_node_hq_t nodes[MAX_NODES];
+
+    ConeMins cone;
+    int  rev       = 0;
+    char lastStable = 'X';
+    char pending    = 'X';
+    int  sameCount  = 0;
+
+    while (g_running) {
+        // Reconnect if TCP dropped
+        if (!tcp.is_connected()) {
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastConnectTry > std::chrono::milliseconds(300)) {
+                lastConnectTry = now;
+                if (tcp.connect_now()) {
+                    std::cout << "[TCP] Reconnected\n";
+                    tcp.send_cmd('X');
+                    lastStable = 'X';
+                }
+            }
+        }
+
+        // Grab one revolution of scan data
+        size_t count = MAX_NODES;
+        ans = drv->grabScanDataHq(nodes, count);
+        if (SL_IS_FAIL(ans)) {
+            if (tcp.is_connected()) tcp.send_cmd('X');
+            continue;
+        }
+
+        drv->ascendScanData(nodes, count);
+
+        for (size_t i = 0; i < count; i++) {
+            const auto& n = nodes[i];
+
+            float angle   = norm360((n.angle_z_q14 * 90.0f) / 16384.0f);
+            float dist_mm = n.dist_mm_q2 / 4.0f;
+
+            if (!(dist_mm > 0.0f) || !std::isfinite(dist_mm)) continue;
+
+            updateCones(cone, toSignedDeg(angle), dist_mm);
+
+            // Revolution boundary — make decision
+            if (n.flag & SL_LIDAR_RESP_MEASUREMENT_SYNCBIT) {
+                rev++;
+
+                char decided = decideLidarCmd(cone);
+
+                // Stability filter
+                if (decided == pending) sameCount++;
+                else { pending = decided; sameCount = 1; }
+                if (sameCount >= REQUIRE_SAME_REV) lastStable = pending;
+
+                // Send to motor controller
+                if (tcp.is_connected()) {
+                    tcp.send_cmd(lastStable);
+                }
+
+                // Console output
+                auto fin = [](float v) { return std::isfinite(v) ? v : -1.0f; };
+                std::cout << "[REV " << std::setw(4) << rev << "] "
+                          << "S=" << std::setw(6) << fin(cone.minStraight) << "mm "
+                          << "L=" << std::setw(6) << fin(cone.minLeft)     << "mm "
+                          << "R=" << std::setw(6) << fin(cone.minRight)    << "mm "
+                          << "=> " << lastStable << " (" << cmdToStr(lastStable) << ")"
+                          << (tcp.is_connected() ? "" : "  [TCP DOWN]")
+                          << "\n";
+
+                cone.reset();
+            }
+        }
+
+        // Heartbeat — keep motor watchdog alive between revolutions
+        auto now = std::chrono::steady_clock::now();
+        if (tcp.is_connected() &&
+            now - lastHeartbeat > std::chrono::milliseconds(HEARTBEAT_MS)) {
+            tcp.send_cmd(lastStable);
+            lastHeartbeat = now;
+        }
+    }
+
+    // ── Shutdown ─────────────────────────────────────────────
+    std::cout << "\n[LiDAR] Shutting down...\n";
+    if (tcp.is_connected()) tcp.send_cmd('X');
+    tcp.close_if_open();
+
+    drv->stop();
+    drv->setMotorSpeed(0);
+    drv->disconnect();
+    delete drv;
+
+    return 0;
+}
